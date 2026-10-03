@@ -33,6 +33,8 @@ from telegram.ext import (
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s", level=logging.INFO
 )
+logging.getLogger("httpx").setLevel(logging.WARNING)  # httpx logs URLs that contain the bot token
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 log = logging.getLogger("gbanbot")
 
 # ----------------------------- CONFIG ---------------------------------------
