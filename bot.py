@@ -99,6 +99,9 @@ def db_all_chats():
     return [r[0] for r in db.execute("SELECT chat_id FROM chats").fetchall()]
 
 
+KNOWN_CHATS = set(db_all_chats())
+
+
 # ----------------------------- HELPERS --------------------------------------
 def is_sudo(user_id: int) -> bool:
     return user_id in SUDO_USERS
@@ -124,16 +127,21 @@ def parse_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return None, ""
 
 
-async def ban_everywhere(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> int:
-    ok = 0
+async def ban_everywhere(context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    """Ban user in every known chat. Returns (success_count, [(chat_id, error)])."""
+    ok, failed = 0, []
     for chat_id in db_all_chats():
         try:
             await context.bot.ban_chat_member(chat_id, user_id)
             ok += 1
-        except Exception:
-            pass
+        except Exception as e:
+            failed.append((chat_id, str(e)))
+            err = str(e).lower()
+            if "chat not found" in err or "kicked" in err or "forbidden" in err:
+                KNOWN_CHATS.discard(chat_id)
+                db_del_chat(chat_id)
         await asyncio.sleep(0.1)  # stay under flood limits
-    return ok
+    return ok, failed
 
 
 # ----------------------------- COMMANDS -------------------------------------
@@ -166,19 +174,22 @@ async def gban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     already = db_get_gban(user_id) is not None
     db_add_gban(user_id, reason, admin.id)
     status = await update.effective_message.reply_text("⏳ Banning everywhere...")
-    count = await ban_everywhere(context, user_id)
+    count, failed = await ban_everywhere(context, user_id)
 
     await status.edit_text(
         f"🔨 {'Updated gban' if already else 'Globally banned'} <code>{user_id}</code>\n"
-        f"Reason: {html.escape(reason)}\nBanned in {count} chats.",
+        f"Reason: {html.escape(reason)}\nBanned in {count} chats, failed in {len(failed)}.",
         parse_mode=ParseMode.HTML,
     )
     await send_log(
         context,
         f"🚫 <b>#GBAN</b>\n<b>User:</b> <code>{user_id}</code>\n"
         f"<b>By:</b> {html.escape(admin.full_name)} (<code>{admin.id}</code>)\n"
-        f"<b>Reason:</b> {html.escape(reason)}\n<b>Chats:</b> {count}",
+        f"<b>Reason:</b> {html.escape(reason)}\n<b>Chats:</b> {count} ok / {len(failed)} failed",
     )
+    if failed:
+        lines = "\n".join(f"<code>{c}</code>: {html.escape(e[:80])}" for c, e in failed[:15])
+        await send_log(context, f"⚠️ <b>GBAN failures</b>\n{lines}")
 
 
 async def ungban(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -258,6 +269,23 @@ async def enforce(update: Update, context: ContextTypes.DEFAULT_TYPE):
             log.warning("Enforce failed in %s: %s", chat.id, e)
 
 
+async def register_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Auto-register any group the bot sees activity in (covers groups added before deploy)."""
+    chat = update.effective_chat
+    if chat and chat.type in ("group", "supergroup") and chat.id not in KNOWN_CHATS:
+        KNOWN_CHATS.add(chat.id)
+        db_add_chat(chat.id, chat.title or "")
+        await send_log(context, f"📌 Registered <b>{html.escape(chat.title or '')}</b> (<code>{chat.id}</code>)")
+
+
+async def chats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_sudo(update.effective_user.id):
+        return
+    rows = db.execute("SELECT chat_id, title FROM chats").fetchall()
+    text = "\n".join(f"{t} ({c})" for c, t in rows) or "None yet."
+    await update.effective_message.reply_text(f"Known chats: {len(rows)}\n{text[:3500]}")
+
+
 async def track_chats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Remember groups where the bot is admin so gban can reach them."""
     ev = update.my_chat_member
@@ -265,10 +293,12 @@ async def track_chats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if chat.type == "private":
         return
     new = ev.new_chat_member
-    if new.status == ChatMemberStatus.ADMINISTRATOR:
+    if new.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.MEMBER):
+        KNOWN_CHATS.add(chat.id)
         db_add_chat(chat.id, chat.title or "")
         await send_log(context, f"➕ Added to <b>{html.escape(chat.title or '')}</b> (<code>{chat.id}</code>)")
-    elif new.status in (ChatMemberStatus.LEFT, ChatMemberStatus.BANNED, ChatMemberStatus.MEMBER):
+    elif new.status in (ChatMemberStatus.LEFT, ChatMemberStatus.BANNED):
+        KNOWN_CHATS.discard(chat.id)
         db_del_chat(chat.id)
 
 
@@ -284,6 +314,8 @@ def main():
     app.add_handler(CommandHandler("gban", gban))
     app.add_handler(CommandHandler("ungban", ungban))
     app.add_handler(CommandHandler("gbanlist", gbanlist))
+    app.add_handler(CommandHandler("chats", chats_cmd))
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS, register_chat), group=-1)
     app.add_handler(ChatMemberHandler(track_chats, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & ~filters.COMMAND, enforce), group=1)
 
