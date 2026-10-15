@@ -1,3 +1,5 @@
 pyrofork
 tgcrypto
 aiosqlite
+openpyxl
+tzdata
