@@ -512,6 +512,7 @@ async def ask_for_number(client: Client, user_id: int, chat_title: str = "the gr
 @app.on_chat_join_request()
 async def on_join_request(client: Client, req: ChatJoinRequest):
     user, chat = req.from_user, req.chat
+    log.info("JOIN REQUEST received: user=%s chat=%s", user.id, chat.id)
     await remember_chat(chat.id)
 
     # Globally banned users are declined straight away
@@ -526,5 +527,4 @@ async def on_join_request(client: Client, req: ChatJoinRequest):
 
     # Already verified before -> approve instantly
     if await get_verified_user(user.id):
-        n = await approve_pending(client, user.id)
-        log.info("Auto-approved verified user %s (%d request(s)
+        n = await approve_pending(client,
