@@ -526,7 +526,7 @@ async def on_join_request(client: Client, req: ChatJoinRequest):
     await db_exec("INSERT OR IGNORE INTO pending (user_id, chat_id) VALUES (?, ?)", (user.id, chat.id))
  
     # Already verified before -> approve instantly
-    if await get_verified_user(user.id):
+ if await get_verified_user(user.id):
         n = await approve_pending(client, user.id)
         log.info("Auto-approved verified user %s (%d request(s))", user.id, n)
         return
@@ -588,7 +588,7 @@ async def on_contact(client: Client, message: Message):
     log.info("Verified %s (%s), approved in %d chat(s)", user.id, phone, n)
  
  
-@app.on_message(filters.private & filters.text & ~filters.command(["start", "list", "gban", "ungban", "gbanlist"]))
+@app.on_message(filters.private & filters.text & ~filters.command(["start", "list", "gban", "ungban", "gbanlist", "status", "myid"]))
 async def remind_contact(client: Client, message: Message):
     if message.from_user and await get_pending_chats(message.from_user.id):
         await message.reply_text("📱 Please tap the button to share your mobile number.", reply_markup=CONTACT_KB)
@@ -609,6 +609,64 @@ async def list_cmd(client: Client, message: Message):
     )
  
  
+ 
+# ==================== 5. DIAGNOSTICS ====================
+@app.on_raw_update(group=-10)
+async def raw_join_logger(client: Client, update, users, chats):
+    """Logs the raw Telegram event so you can see if join requests reach the bot at all."""
+    if type(update).__name__ == "UpdateBotChatInviteRequester":
+        log.info("RAW join-request event from Telegram: user_id=%s peer=%s", update.user_id, update.peer)
+ 
+ 
+async def rights_report() -> str:
+    """Checks the bot's admin rights in every known group."""
+    if not KNOWN_CHATS:
+        return "No groups known yet. Send a message in each group or re-add the bot."
+    lines = []
+    for chat_id in list(KNOWN_CHATS):
+        try:
+            chat = await app.get_chat(chat_id)
+            me = await app.get_chat_member(chat_id, BOT_ID)
+            if me.status == enums.ChatMemberStatus.OWNER:
+                invite = ban = True
+            elif me.status == enums.ChatMemberStatus.ADMINISTRATOR and me.privileges:
+                invite = bool(me.privileges.can_invite_users)
+                ban = bool(me.privileges.can_restrict_members)
+            else:
+                invite = ban = False
+            lines.append(
+                f"{'✅' if invite else '❌'} **{chat.title}** (`{chat_id}`)\n"
+                f"    Invite Users: {'yes' if invite else 'NO - join requests will not work'}\n"
+                f"    Ban Users: {'yes' if ban else 'NO'}"
+            )
+        except Exception as e:
+            lines.append(f"❌ `{chat_id}`: {type(e).__name__}")
+    return "\n".join(lines)
+ 
+ 
+@app.on_message(filters.command("myid") & filters.private)
+async def myid_cmd(client: Client, message: Message):
+    await message.reply_text(
+        f"Your ID: `{message.from_user.id}`\n"
+        f"Configured OWNER_ID: `{OWNER_ID}`\n"
+        f"Owner match: {'✅ yes' if message.from_user.id == OWNER_ID else '❌ no'}"
+    )
+ 
+ 
+@app.on_message(filters.command("status") & filters.private & owner_only)
+async def status_cmd(client: Client, message: Message):
+    await message.reply_text("🔍 Checking groups...")
+    report = await rights_report()
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT COUNT(*) FROM users") as cur:
+            users = (await cur.fetchone())[0]
+        async with db.execute("SELECT COUNT(*) FROM pending") as cur:
+            pend = (await cur.fetchone())[0]
+    await message.reply_text(
+        f"📊 Verified users: {users}\n⏳ Pending requests: {pend}\n\n{report}"
+    )
+ 
+ 
 # ==================== START ====================
 @app.on_message(filters.command("start") & filters.private)
 async def start_handler(client: Client, message: Message):
@@ -617,7 +675,7 @@ async def start_handler(client: Client, message: Message):
         return await ask_for_number(client, user.id)
     await message.reply_text(
         "👋 **Multi-Control Bot Online!**\n\n"
-        "**Owner:** `/gban`, `/ungban`, `/gbanlist`, `/list`\n"
+        "**Owner:** `/gban`, `/ungban`, `/gbanlist`, `/list`, `/status`\n"
         "**Admins (groups):** `/vcon`, `/vcoff`, `/vcmute`, `/vcunmute`"
     )
  
@@ -630,6 +688,12 @@ async def main():
     BOT_ID = (await app.get_me()).id
     ASSISTANT_ID = (await assistant.get_me()).id
     log.info("Bot %s and assistant %s started", BOT_ID, ASSISTANT_ID)
+    report = await rights_report()
+    log.info("Group rights report:\n%s", report)
+    try:
+        await app.send_message(OWNER_ID, f"✅ Bot started.\n\n{report}")
+    except RPCError:
+        log.warning("Could not DM owner. Open the bot and press /start once.")
     await idle()
     await assistant.stop()
     await app.stop()
