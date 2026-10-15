@@ -2,13 +2,20 @@ import os
 import asyncio
 import logging
 import random
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import aiosqlite
+from openpyxl import Workbook
+from openpyxl.styles import Font, Alignment, PatternFill
 from pyrogram import Client, filters, idle, enums
-from pyrogram.types import Message, ChatMemberUpdated
+from pyrogram.types import (
+    Message, ChatMemberUpdated, ChatJoinRequest,
+    ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove,
+)
 from pyrogram.errors import (
     FloodWait, RPCError, ChatAdminRequired, UserAdminInvalid,
-    PeerIdInvalid, ChannelPrivate,
+    PeerIdInvalid, ChannelPrivate, UserAlreadyParticipant,
 )
 from pyrogram.raw import functions, types as raw_types
 
@@ -23,26 +30,44 @@ API_ID = int(os.environ.get("API_ID", 0))
 API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 OWNER_ID = int(os.environ.get("OWNER_ID", 0))
+SESSION_STRING = os.environ.get("SESSION_STRING", "")
 DB_PATH = os.environ.get("DB_PATH", "/data/bot.db")  # mount a Railway volume at /data
+EXCEL_PATH = os.path.join(os.path.dirname(DB_PATH) or ".", "users.xlsx")
+TZ = ZoneInfo(os.environ.get("TIMEZONE", "Asia/Kolkata"))
+# Optional: only accept numbers starting with these country codes, e.g. "91" or "91,1". Empty = any.
+ALLOWED_CODES = [c.strip().lstrip("+") for c in os.environ.get("ALLOWED_COUNTRY_CODES", "").split(",") if c.strip()]
 
 if not all([API_ID, API_HASH, BOT_TOKEN, OWNER_ID]):
     raise SystemExit("Missing one of: API_ID, API_HASH, BOT_TOKEN, OWNER_ID")
+if not SESSION_STRING:
+    raise SystemExit("Missing SESSION_STRING (assistant account is required for VC control)")
 
+# Bot account: receives commands, handles GBan
 app = Client(
     "MultiControlBot",
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
-    in_memory=True,  # Railway disk is ephemeral; avoids stale session files
+    in_memory=True,
+)
+
+# Assistant user account: performs voice chat actions (bots are not allowed to)
+assistant = Client(
+    "Assistant",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    session_string=SESSION_STRING,
+    in_memory=True,
+    no_updates=True,
 )
 
 # In-memory caches (backed by SQLite)
 GBANNED: set[int] = set()
 KNOWN_CHATS: set[int] = set()
 BOT_ID: int = 0
+ASSISTANT_ID: int = 0
 
 ADMIN_STATUSES = (enums.ChatMemberStatus.ADMINISTRATOR, enums.ChatMemberStatus.OWNER)
-GROUP_TYPES = (enums.ChatType.GROUP, enums.ChatType.SUPERGROUP)
 
 
 # ==================== DATABASE ====================
@@ -54,6 +79,14 @@ async def db_init():
             "CREATE TABLE IF NOT EXISTS gbans ("
             "user_id INTEGER PRIMARY KEY, reason TEXT, "
             "banned_at TEXT DEFAULT CURRENT_TIMESTAMP)"
+        )
+        await db.execute(
+            "CREATE TABLE IF NOT EXISTS users ("
+            "user_id INTEGER PRIMARY KEY, username TEXT, phone TEXT, joined_at TEXT)"
+        )
+        await db.execute(
+            "CREATE TABLE IF NOT EXISTS pending ("
+            "user_id INTEGER, chat_id INTEGER, PRIMARY KEY (user_id, chat_id))"
         )
         await db.commit()
         async with db.execute("SELECT chat_id FROM chats") as cur:
@@ -97,9 +130,9 @@ async def is_admin(client: Client, message: Message) -> bool:
         return False
 
 
-async def bot_can_manage_vc(client: Client, chat_id: int) -> bool:
+async def assistant_can_manage_vc(chat_id: int) -> bool:
     try:
-        me = await client.get_chat_member(chat_id, BOT_ID)
+        me = await assistant.get_chat_member(chat_id, ASSISTANT_ID)
     except RPCError:
         return False
     if me.status == enums.ChatMemberStatus.OWNER:
@@ -107,13 +140,14 @@ async def bot_can_manage_vc(client: Client, chat_id: int) -> bool:
     return bool(me.privileges and me.privileges.can_manage_video_chats)
 
 
-async def get_group_call(client: Client, chat_id: int):
-    """Return the InputGroupCall of the active VC, or None."""
-    peer = await client.resolve_peer(chat_id)
+async def get_group_call(chat_id: int):
+    """Return the InputGroupCall of the active VC, or None (uses assistant account)."""
+    await assistant.get_chat(chat_id)  # caches the peer for the assistant
+    peer = await assistant.resolve_peer(chat_id)
     if isinstance(peer, raw_types.InputPeerChannel):
-        full = await client.invoke(functions.channels.GetFullChannel(channel=peer))
+        full = await assistant.invoke(functions.channels.GetFullChannel(channel=peer))
     else:  # basic group
-        full = await client.invoke(functions.messages.GetFullChat(chat_id=-chat_id))
+        full = await assistant.invoke(functions.messages.GetFullChat(chat_id=-chat_id))
     return getattr(full.full_chat, "call", None)
 
 
@@ -182,8 +216,8 @@ async def gban_cmd(client: Client, message: Message):
         return await message.reply_text(
             "Usage: `/gban <user_id|@username> [reason]` or reply to a user with `/gban [reason]`"
         )
-    if target_id in (OWNER_ID, BOT_ID):
-        return await message.reply_text("❌ I won't ban the owner or myself.")
+    if target_id in (OWNER_ID, BOT_ID, ASSISTANT_ID):
+        return await message.reply_text("❌ I won't ban the owner or my own accounts.")
 
     reason = reason or "No reason provided."
     GBANNED.add(target_id)
@@ -284,21 +318,25 @@ async def bot_membership_tracker(client: Client, update: ChatMemberUpdated):
         log.info("Removed from chat %s", update.chat.id)
 
 
-# ==================== 2. VOICE CHAT START / END ====================
+# ==================== 2. VOICE CHAT START / END (via assistant) ====================
+NEED_RIGHTS = (
+    "❌ The assistant account must be in this group as admin with "
+    "**Manage Video Chats** enabled."
+)
+
+
 @app.on_message(filters.command(["vcon", "startvc"]) & filters.group)
 async def vc_on(client: Client, message: Message):
     if not await is_admin(client, message):
         return await message.reply_text("❌ Only group admins can control voice chats.")
-    if not await bot_can_manage_vc(client, message.chat.id):
-        return await message.reply_text(
-            "❌ I need admin rights with **Manage Video Chats** enabled."
-        )
+    if not await assistant_can_manage_vc(message.chat.id):
+        return await message.reply_text(NEED_RIGHTS)
     try:
-        if await get_group_call(client, message.chat.id):
+        if await get_group_call(message.chat.id):
             return await message.reply_text("⚠️ A voice chat is already active.")
-        await client.invoke(
+        await assistant.invoke(
             functions.phone.CreateGroupCall(
-                peer=await client.resolve_peer(message.chat.id),
+                peer=await assistant.resolve_peer(message.chat.id),
                 random_id=random.randint(1, 2**31 - 1),
             )
         )
@@ -312,41 +350,38 @@ async def vc_on(client: Client, message: Message):
 async def vc_off(client: Client, message: Message):
     if not await is_admin(client, message):
         return await message.reply_text("❌ Only group admins can control voice chats.")
-    if not await bot_can_manage_vc(client, message.chat.id):
-        return await message.reply_text(
-            "❌ I need admin rights with **Manage Video Chats** enabled."
-        )
+    if not await assistant_can_manage_vc(message.chat.id):
+        return await message.reply_text(NEED_RIGHTS)
     try:
-        call = await get_group_call(client, message.chat.id)
+        call = await get_group_call(message.chat.id)
         if not call:
             return await message.reply_text("⚠️ No active Voice Chat in this group.")
-        await client.invoke(functions.phone.DiscardGroupCall(call=call))
+        await assistant.invoke(functions.phone.DiscardGroupCall(call=call))
         await message.reply_text("🛑 **Voice Chat** ended.")
     except RPCError as e:
         log.exception("vcoff failed")
         await message.reply_text(f"❌ Failed to end Voice Chat: `{e}`")
 
 
-# ==================== 3. VC MUTE / UNMUTE ====================
+# ==================== 3. VC MUTE / UNMUTE (via assistant) ====================
 async def _vc_set_mute(client: Client, message: Message, mute: bool):
     if not await is_admin(client, message):
         return await message.reply_text("❌ Admin command only.")
     if not message.reply_to_message or not message.reply_to_message.from_user:
         return await message.reply_text("⚠️ Reply to the user's message.")
-    if not await bot_can_manage_vc(client, message.chat.id):
-        return await message.reply_text(
-            "❌ I need admin rights with **Manage Video Chats** enabled."
-        )
+    if not await assistant_can_manage_vc(message.chat.id):
+        return await message.reply_text(NEED_RIGHTS)
 
     target = message.reply_to_message.from_user
     try:
-        call = await get_group_call(client, message.chat.id)
+        call = await get_group_call(message.chat.id)
         if not call:
             return await message.reply_text("⚠️ No active Voice Chat.")
-        await client.invoke(
+        await assistant.get_chat_member(message.chat.id, target.id)  # cache peer
+        await assistant.invoke(
             functions.phone.EditGroupCallParticipant(
                 call=call,
-                participant=await client.resolve_peer(target.id),
+                participant=await assistant.resolve_peer(target.id),
                 muted=mute,
             )
         )
@@ -354,12 +389,12 @@ async def _vc_set_mute(client: Client, message: Message, mute: bool):
             await message.reply_text(f"🔇 Muted {target.mention} in the Voice Chat.")
         else:
             await message.reply_text(
-                f"🔊 {target.mention} is allowed to speak again (they must unmute themselves)."
+                f"🔊 {target.mention} may speak again (they must unmute themselves)."
             )
     except RPCError as e:
         log.exception("vc mute/unmute failed")
         await message.reply_text(
-            f"❌ Error: `{e}`\n(The user must be currently joined in the voice chat.)"
+            f"❌ Error: `{e}`\n(The user must currently be joined in the voice chat.)"
         )
 
 
@@ -373,25 +408,123 @@ async def vc_unmute(client: Client, message: Message):
     await _vc_set_mute(client, message, False)
 
 
-# ==================== START ====================
-@app.on_message(filters.command("start") & filters.private)
-async def start_handler(client: Client, message: Message):
-    await message.reply_text(
-        "👋 **Multi-Control Bot Online!**\n\n"
-        "**Owner:** `/gban`, `/ungban`, `/gbanlist`\n"
-        "**Admins (groups):** `/vcon`, `/vcoff`, `/vcmute`, `/vcunmute`"
+
+# ==================== 4. JOIN REQUEST VERIFICATION + EXCEL ====================
+EXCEL_LOCK = asyncio.Lock()
+HEADERS = ["SNO", "USERNAME", "USER ID", "JOINED DATE", "MOBILE NUMBER"]
+
+CONTACT_KB = ReplyKeyboardMarkup(
+    [[KeyboardButton("📱 Share my mobile number", request_contact=True)]],
+    resize_keyboard=True,
+    one_time_keyboard=True,
+)
+
+
+def _write_excel(rows: list):
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Users"
+    ws.append(HEADERS)
+    for cell in ws[1]:
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = PatternFill("solid", fgColor="1F4E78")
+        cell.alignment = Alignment(horizontal="center")
+    for i, (user_id, username, phone, joined_at) in enumerate(rows, start=1):
+        ws.append([i, username or "N/A", int(user_id), joined_at, phone])
+        ws.cell(row=i + 1, column=5).number_format = "@"  # keep number as text
+        ws.cell(row=i + 1, column=3).number_format = "0"
+    for col, width in zip("ABCDE", (8, 24, 16, 22, 18)):
+        ws.column_dimensions[col].width = width
+    ws.freeze_panes = "A2"
+    wb.save(EXCEL_PATH)
+
+
+async def export_excel() -> str:
+    """Rebuild users.xlsx from the DB and return its path."""
+    async with EXCEL_LOCK:
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute(
+                "SELECT user_id, username, phone, joined_at FROM users ORDER BY rowid"
+            ) as cur:
+                rows = await cur.fetchall()
+        await asyncio.to_thread(_write_excel, rows)
+    return EXCEL_PATH
+
+
+async def get_verified_user(user_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT phone FROM users WHERE user_id = ?", (user_id,)) as cur:
+            return await cur.fetchone()
+
+
+async def get_pending_chats(user_id: int) -> list:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT chat_id FROM pending WHERE user_id = ?", (user_id,)) as cur:
+            return [r[0] for r in await cur.fetchall()]
+
+
+async def save_user(user, phone: str):
+    joined = datetime.now(TZ).strftime("%d-%m-%Y %H:%M:%S")
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO users (user_id, username, phone, joined_at) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET username = excluded.username, phone = excluded.phone",
+            (user.id, user.username, phone, joined),
+        )
+        await db.commit()
+    await export_excel()
+
+
+async def approve_pending(client: Client, user_id: int) -> int:
+    """Approve every pending join request of this user. Returns how many were approved."""
+    approved = 0
+    for chat_id in await get_pending_chats(user_id):
+        try:
+            await client.approve_chat_join_request(chat_id, user_id)
+            approved += 1
+        except UserAlreadyParticipant:
+            approved += 1
+        except FloodWait as e:
+            await asyncio.sleep(e.value + 1)
+            try:
+                await client.approve_chat_join_request(chat_id, user_id)
+                approved += 1
+            except RPCError:
+                log.warning("Approve retry failed for %s in %s", user_id, chat_id)
+        except ChannelPrivate:
+            await forget_chat(chat_id)
+        except RPCError as e:
+            log.warning("Approve failed for %s in %s: %s", user_id, chat_id, e)
+        await db_exec("DELETE FROM pending WHERE user_id = ? AND chat_id = ?", (user_id, chat_id))
+    return approved
+
+
+async def ask_for_number(client: Client, user_id: int, chat_title: str = "the group"):
+    await client.send_message(
+        user_id,
+        f"👋 Hello! You requested to join **{chat_title}**.\n\n"
+        "To verify your account, tap the button below to **share your mobile number**.\n"
+        "Only the number linked to your own Telegram account is accepted.",
+        reply_markup=CONTACT_KB,
     )
 
 
-async def main():
-    global BOT_ID
-    await db_init()
-    await app.start()
-    BOT_ID = (await app.get_me()).id
-    log.info("Bot started as %s", BOT_ID)
-    await idle()
-    await app.stop()
+@app.on_chat_join_request()
+async def on_join_request(client: Client, req: ChatJoinRequest):
+    user, chat = req.from_user, req.chat
+    await remember_chat(chat.id)
 
+    # Globally banned users are declined straight away
+    if user.id in GBANNED:
+        try:
+            await client.decline_chat_join_request(chat.id, user.id)
+        except RPCError:
+            pass
+        return
 
-if __name__ == "__main__":
-    app.run(main())
+    await db_exec("INSERT OR IGNORE INTO pending (user_id, chat_id) VALUES (?, ?)", (user.id, chat.id))
+
+    # Already verified before -> approve instantly
+    if await get_verified_user(user.id):
+        n = await approve_pending(client, user.id)
+        log.info("Auto-approved verified user %s (%d request(s)
