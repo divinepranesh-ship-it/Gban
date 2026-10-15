@@ -1,327 +1,215 @@
-"""
-Simple Telegram GBAN Bot (single file)
-- Library : python-telegram-bot v21+
-- Storage : SQLite (set DB_PATH to a Railway Volume path, e.g. /data/gban.db, to persist)
-- Logs    : every action is sent to LOG_GROUP_ID
-
-Environment variables:
-    BOT_TOKEN      - token from @BotFather                (required)
-    OWNER_ID       - your Telegram user ID                (required)
-    LOG_GROUP_ID   - log group/channel ID, e.g. -100123.. (required)
-    SUDO_USERS     - comma separated user IDs             (optional)
-    DB_PATH        - sqlite file path (default gban.db)   (optional)
-"""
-
-import asyncio
-import html
-import logging
 import os
-import sqlite3
-import time
+import asyncio
+from pyrogram import Client, filters
+from pyrogram.types import Message
+from pyrogram.errors import RPCError
+from pyrogram.raw import functions, types
 
-from telegram import Update
-from telegram.constants import ChatMemberStatus, ParseMode
-from telegram.ext import (
-    Application,
-    ChatMemberHandler,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
+# Configuration from Environment Variables (Railway)
+API_ID = int(os.environ.get("API_ID", 0))
+API_HASH = os.environ.get("API_HASH", "")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+OWNER_ID = int(os.environ.get("OWNER_ID", 0))  # Your Telegram User ID
+
+app = Client(
+    "MultiControlBot",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN
 )
 
-logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s", level=logging.INFO
-)
-logging.getLogger("httpx").setLevel(logging.WARNING)  # httpx logs URLs that contain the bot token
-logging.getLogger("httpcore").setLevel(logging.WARNING)
-log = logging.getLogger("gbanbot")
+# In-memory storage for GBanned users & active VC lock states
+GBANNED_USERS = set()
+VC_LOCKED_CHATS = set()
 
-# ----------------------------- CONFIG ---------------------------------------
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-OWNER_ID = int(os.environ["OWNER_ID"])
-LOG_GROUP_ID = int(os.environ["LOG_GROUP_ID"])
-SUDO_USERS = {
-    int(x) for x in os.getenv("SUDO_USERS", "").replace(" ", "").split(",") if x.strip()
-}
-SUDO_USERS.add(OWNER_ID)
-DB_PATH = os.getenv("DB_PATH", "gban.db")
-
-# ----------------------------- DATABASE -------------------------------------
-os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
-db = sqlite3.connect(DB_PATH, check_same_thread=False)
-db.execute(
-    """CREATE TABLE IF NOT EXISTS gbans(
-        user_id INTEGER PRIMARY KEY,
-        reason  TEXT,
-        by_id   INTEGER,
-        ts      INTEGER
-    )"""
-)
-db.execute("CREATE TABLE IF NOT EXISTS chats(chat_id INTEGER PRIMARY KEY, title TEXT)")
-db.commit()
-
-
-def db_get_gban(user_id: int):
-    return db.execute(
-        "SELECT user_id, reason, by_id, ts FROM gbans WHERE user_id=?", (user_id,)
-    ).fetchone()
-
-
-def db_add_gban(user_id: int, reason: str, by_id: int):
-    db.execute(
-        "INSERT OR REPLACE INTO gbans VALUES(?,?,?,?)",
-        (user_id, reason, by_id, int(time.time())),
-    )
-    db.commit()
-
-
-def db_del_gban(user_id: int):
-    db.execute("DELETE FROM gbans WHERE user_id=?", (user_id,))
-    db.commit()
-
-
-def db_all_gbans():
-    return db.execute("SELECT user_id, reason FROM gbans ORDER BY ts DESC").fetchall()
-
-
-def db_add_chat(chat_id: int, title: str):
-    db.execute("INSERT OR REPLACE INTO chats VALUES(?,?)", (chat_id, title))
-    db.commit()
-
-
-def db_del_chat(chat_id: int):
-    db.execute("DELETE FROM chats WHERE chat_id=?", (chat_id,))
-    db.commit()
-
-
-def db_all_chats():
-    return [r[0] for r in db.execute("SELECT chat_id FROM chats").fetchall()]
-
-
-KNOWN_CHATS = set(db_all_chats())
-
-
-# ----------------------------- HELPERS --------------------------------------
-def is_sudo(user_id: int) -> bool:
-    return user_id in SUDO_USERS
-
-
-async def send_log(context: ContextTypes.DEFAULT_TYPE, text: str):
+# Helper: Check if user is Admin or Owner
+async def is_admin(client: Client, chat_id: int, user_id: int) -> bool:
+    if user_id == OWNER_ID:
+        return True
     try:
-        await context.bot.send_message(
-            LOG_GROUP_ID, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True
+        member = await client.get_chat_member(chat_id, user_id)
+        return member.status in ["administrator", "creator"]
+    except Exception:
+        return False
+
+# ==================== 1. GLOBAL BAN (GBAN) MODULE ====================
+
+@app.on_message(filters.command("gban") & filters.private)
+async def gban_user(client: Client, message: Message):
+    if message.from_user.id != OWNER_ID:
+        return await message.reply_text("❌ You are not authorized to use Global Ban.")
+    
+    if len(message.command) < 2:
+        return await message.reply_text("Usage: `/gban <user_id> [reason]`", parse_mode="markdown")
+    
+    try:
+        target_id = int(message.command[1])
+    except ValueError:
+        return await message.reply_text("❌ Invalid User ID.")
+    
+    reason = " ".join(message.command[2:]) or "No reason provided."
+    GBANNED_USERS.add(target_id)
+    
+    status_msg = await message.reply_text(f"🔄 Initiating Global Ban for `{target_id}` across all groups...")
+    
+    success_count = 0
+    fail_count = 0
+    
+    # Iterate through all dialogs/groups where the bot is present
+    async for dialog in client.get_dialogs():
+        if dialog.chat.type in ["supergroup", "group"]:
+            chat_id = dialog.chat.id
+            try:
+                # Check if bot has admin rights to ban members in that group
+                bot_member = await client.get_chat_member(chat_id, "me")
+                if bot_member.privileges and bot_member.privileges.can_restrict_members:
+                    await client.ban_chat_member(chat_id, target_id)
+                    success_count += 1
+                else:
+                    fail_count += 1
+            except Exception:
+                fail_count += 1
+                
+    await status_msg.edit_text(
+        f"✅ **Global Ban Executed Successfully!**\n\n"
+        f"👤 **User ID:** `{target_id}`\n"
+        f"📝 **Reason:** {reason}\n"
+        f"🌐 **Banned in Groups:** {success_count}\n"
+        f"⚠️ **Failed/No Rights:** {fail_count}"
+    )
+
+@app.on_message(filters.new_chat_members)
+async def auto_gban_check(client: Client, message: Message):
+    """Automatically ban incoming users if they are in the GBAN list"""
+    chat_id = message.chat.id
+    for member in message.new_chat_members:
+        if member.id in GBANNED_USERS:
+            try:
+                await client.ban_chat_member(chat_id, member.id)
+                await message.reply_text(f"🚨 Globally Banned User `{member.id}` detected and automatically removed!")
+            except Exception:
+                pass
+
+
+# ==================== 2. VOICE CHAT / GROUP CALL CONTROL ====================
+
+@app.on_message(filters.command(["vcon", "startvc"]) & filters.group)
+async def turn_on_vc(client: Client, message: Message):
+    if not await is_admin(client, message.chat.id, message.from_user.id):
+        return await message.reply_text("❌ Only group admins can control voice chats.")
+    
+    try:
+        # Using Telegram Raw API to start a group call / video chat
+        await client.invoke(
+            functions.phone.CreateGroupCall(
+                peer=await client.resolve_peer(message.chat.id),
+                random_id=int(asyncio.get_event_loop().time()) % 1000000
+            )
         )
+        await message.reply_text("🎙️ **Voice Chat** has been successfully started!")
+    except RPCError as e:
+        await message.reply_text(f"❌ Failed to start Voice Chat: `{e}`")
+
+@app.on_message(filters.command(["vcoff", "endvc"]) & filters.group)
+async def turn_off_vc(client: Client, message: Message):
+    if not await is_admin(client, message.chat.id, message.from_user.id):
+        return await message.reply_text("❌ Only group admins can control voice chats.")
+    
+    try:
+        # Fetch full chat info to get the group call reference
+        chat_full = await client.invoke(
+            functions.channels.GetFullChannel(
+                channel=await client.resolve_peer(message.chat.id)
+            )
+        )
+        call = chat_full.full_chat.call
+        if call:
+            await client.invoke(
+                functions.phone.DiscardGroupCall(call=call)
+            )
+            await message.reply_text("🛑 **Voice Chat** has been ended.")
+        else:
+            await message.reply_text("⚠️ No active Voice Chat found in this group.")
+    except RPCError as e:
+        await message.reply_text(f"❌ Failed to end Voice Chat: `{e}`")
+
+
+# ==================== 3. VOICE CHAT SPEAKER MUTE CONTROLS ====================
+
+@app.on_message(filters.command("vcmute") & filters.group)
+async def mute_vc_participants(client: Client, message: Message):
+    """Mutes a specific user in the voice chat (Requires admin rights)"""
+    if not await is_admin(client, message.chat.id, message.from_user.id):
+        return await message.reply_text("❌ Admin command only.")
+        
+    if not message.reply_to_message:
+        return await message.reply_text("⚠️ Please reply to the user you want to mute in the voice chat.")
+        
+    target_user = message.reply_to_message.from_user
+    if not target_user:
+        return await message.reply_text("❌ Could not identify target user.")
+        
+    try:
+        chat_full = await client.invoke(
+            functions.channels.GetFullChannel(channel=await client.resolve_peer(message.chat.id))
+        )
+        call = chat_full.full_chat.call
+        if call:
+            await client.invoke(
+                functions.phone.EditGroupCallParticipant(
+                    call=call,
+                    participant=await client.resolve_peer(target_user.id),
+                    muted=True
+                )
+            )
+            await message.reply_text(f"🔇 Muted {target_user.mention} in the Voice Chat.")
+        else:
+            await message.reply_text("⚠️ No active Voice Chat found.")
     except Exception as e:
-        log.warning("Could not send to log group: %s", e)
+        await message.reply_text(f"❌ Error muting user: `{e}`")
 
 
-def parse_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Return (user_id, reason) from a reply or from '/cmd <id> [reason]'."""
-    msg = update.effective_message
-    args = context.args or []
-    if msg.reply_to_message and msg.reply_to_message.from_user:
-        return msg.reply_to_message.from_user.id, " ".join(args)
-    if args and args[0].lstrip("-").isdigit():
-        return int(args[0]), " ".join(args[1:])
-    return None, ""
-
-
-async def ban_everywhere(context: ContextTypes.DEFAULT_TYPE, user_id: int):
-    """Ban user in every known chat. Returns (success_count, [(chat_id, error)])."""
-    ok, failed = 0, []
-    for chat_id in db_all_chats():
-        try:
-            await context.bot.ban_chat_member(chat_id, user_id)
-            ok += 1
-        except Exception as e:
-            failed.append((chat_id, str(e)))
-            err = str(e).lower()
-            if "chat not found" in err or "kicked" in err or "forbidden" in err:
-                KNOWN_CHATS.discard(chat_id)
-                db_del_chat(chat_id)
-        await asyncio.sleep(0.1)  # stay under flood limits
-    return ok, failed
-
-
-# ----------------------------- COMMANDS -------------------------------------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text(
-        "👋 I'm a global ban bot.\n\n"
-        "Sudo commands:\n"
-        "/gban <id|reply> [reason]\n"
-        "/ungban <id|reply>\n"
-        "/gbanlist\n"
-        "/chatid"
-    )
-
-
-async def chatid(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text(f"<code>{update.effective_chat.id}</code>", parse_mode=ParseMode.HTML)
-
-
-async def gban(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    admin = update.effective_user
-    if not is_sudo(admin.id):
-        return
-    user_id, reason = parse_target(update, context)
-    if not user_id:
-        return await update.effective_message.reply_text("Usage: /gban <user_id> [reason] (or reply to a user)")
-    if user_id in SUDO_USERS or user_id == context.bot.id:
-        return await update.effective_message.reply_text("I can't gban that user.")
-    reason = reason or "No reason given"
-
-    already = db_get_gban(user_id) is not None
-    db_add_gban(user_id, reason, admin.id)
-    status = await update.effective_message.reply_text("⏳ Banning everywhere...")
-    count, failed = await ban_everywhere(context, user_id)
-
-    await status.edit_text(
-        f"🔨 {'Updated gban' if already else 'Globally banned'} <code>{user_id}</code>\n"
-        f"Reason: {html.escape(reason)}\nBanned in {count} chats, failed in {len(failed)}.",
-        parse_mode=ParseMode.HTML,
-    )
-    await send_log(
-        context,
-        f"🚫 <b>#GBAN</b>\n<b>User:</b> <code>{user_id}</code>\n"
-        f"<b>By:</b> {html.escape(admin.full_name)} (<code>{admin.id}</code>)\n"
-        f"<b>Reason:</b> {html.escape(reason)}\n<b>Chats:</b> {count} ok / {len(failed)} failed",
-    )
-    if failed:
-        lines = "\n".join(f"<code>{c}</code>: {html.escape(e[:80])}" for c, e in failed[:15])
-        await send_log(context, f"⚠️ <b>GBAN failures</b>\n{lines}")
-
-
-async def ungban(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    admin = update.effective_user
-    if not is_sudo(admin.id):
-        return
-    user_id, _ = parse_target(update, context)
-    if not user_id:
-        return await update.effective_message.reply_text("Usage: /ungban <user_id> (or reply to a user)")
-    if not db_get_gban(user_id):
-        return await update.effective_message.reply_text("That user isn't gbanned.")
-    db_del_gban(user_id)
-
-    count = 0
-    for chat_id in db_all_chats():
-        try:
-            await context.bot.unban_chat_member(chat_id, user_id, only_if_banned=True)
-            count += 1
-        except Exception:
-            pass
-        await asyncio.sleep(0.1)
-
-    await update.effective_message.reply_text(f"✅ Ungbanned <code>{user_id}</code> ({count} chats).", parse_mode=ParseMode.HTML)
-    await send_log(
-        context,
-        f"✅ <b>#UNGBAN</b>\n<b>User:</b> <code>{user_id}</code>\n"
-        f"<b>By:</b> {html.escape(admin.full_name)} (<code>{admin.id}</code>)",
-    )
-
-
-async def gbanlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_sudo(update.effective_user.id):
-        return
-    rows = db_all_gbans()
-    if not rows:
-        return await update.effective_message.reply_text("No gbanned users.")
-    text = "\n".join(f"{uid} — {r}" for uid, r in rows)
-    if len(text) > 3500:
-        text = text[:3500] + "\n..."
-    await update.effective_message.reply_text(f"Gbanned users ({len(rows)}):\n{text}")
-
-
-# ----------------------------- ENFORCEMENT ----------------------------------
-async def enforce(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Ban gbanned users when they speak or join."""
-    chat = update.effective_chat
-    msg = update.effective_message
-    if not chat or chat.type == "private" or not msg:
-        return
-
-    users = []
-    if msg.new_chat_members:
-        users = list(msg.new_chat_members)
-    elif update.effective_user:
-        users = [update.effective_user]
-
-    for u in users:
-        row = db_get_gban(u.id)
-        if not row:
-            continue
-        try:
-            await context.bot.ban_chat_member(chat.id, u.id)
-            if not msg.new_chat_members:
-                await msg.delete()
-            await context.bot.send_message(
-                chat.id,
-                f"🚫 Globally banned user removed.\n<b>ID:</b> <code>{u.id}</code>\n"
-                f"<b>Reason:</b> {html.escape(row[1] or 'N/A')}",
-                parse_mode=ParseMode.HTML,
+@app.on_message(filters.command("vcunmute") & filters.group)
+async def unmute_vc_participants(client: Client, message: Message):
+    """Unmutes a specific user in the voice chat"""
+    if not await is_admin(client, message.chat.id, message.from_user.id):
+        return await message.reply_text("❌ Admin command only.")
+        
+    if not message.reply_to_message:
+        return await message.reply_text("⚠️ Please reply to the user you want to unmute.")
+        
+    target_user = message.reply_to_message.from_user
+    if not target_user:
+        return await message.reply_text("❌ Could not identify target user.")
+        
+    try:
+        chat_full = await client.invoke(
+            functions.channels.GetFullChannel(channel=await client.resolve_peer(message.chat.id))
+        )
+        call = chat_full.full_chat.call
+        if call:
+            await client.invoke(
+                functions.phone.EditGroupCallParticipant(
+                    call=call,
+                    participant=await client.resolve_peer(target_user.id),
+                    muted=False
+                )
             )
-            await send_log(
-                context,
-                f"🛡 <b>#ENFORCED</b>\n<b>User:</b> <code>{u.id}</code>\n"
-                f"<b>Chat:</b> {html.escape(chat.title or str(chat.id))} (<code>{chat.id}</code>)",
-            )
-        except Exception as e:
-            log.warning("Enforce failed in %s: %s", chat.id, e)
+            await message.reply_text(f"🔊 Unmuted {target_user.mention} in the Voice Chat.")
+        else:
+            await message.reply_text("⚠️ No active Voice Chat found.")
+    except Exception as e:
+        await message.reply_text(f"❌ Error unmuting user: `{e}`")
 
-
-async def register_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Auto-register any group the bot sees activity in (covers groups added before deploy)."""
-    chat = update.effective_chat
-    if chat and chat.type in ("group", "supergroup") and chat.id not in KNOWN_CHATS:
-        KNOWN_CHATS.add(chat.id)
-        db_add_chat(chat.id, chat.title or "")
-        await send_log(context, f"📌 Registered <b>{html.escape(chat.title or '')}</b> (<code>{chat.id}</code>)")
-
-
-async def chats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_sudo(update.effective_user.id):
-        return
-    rows = db.execute("SELECT chat_id, title FROM chats").fetchall()
-    text = "\n".join(f"{t} ({c})" for c, t in rows) or "None yet."
-    await update.effective_message.reply_text(f"Known chats: {len(rows)}\n{text[:3500]}")
-
-
-async def track_chats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Remember groups where the bot is admin so gban can reach them."""
-    ev = update.my_chat_member
-    chat = ev.chat
-    if chat.type == "private":
-        return
-    new = ev.new_chat_member
-    if new.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.MEMBER):
-        KNOWN_CHATS.add(chat.id)
-        db_add_chat(chat.id, chat.title or "")
-        await send_log(context, f"➕ Added to <b>{html.escape(chat.title or '')}</b> (<code>{chat.id}</code>)")
-    elif new.status in (ChatMemberStatus.LEFT, ChatMemberStatus.BANNED):
-        KNOWN_CHATS.discard(chat.id)
-        db_del_chat(chat.id)
-
-
-async def post_init(app: Application):
-    await app.bot.send_message(LOG_GROUP_ID, "✅ GBAN bot started.")
-
-
-def main():
-    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("chatid", chatid))
-    app.add_handler(CommandHandler("gban", gban))
-    app.add_handler(CommandHandler("ungban", ungban))
-    app.add_handler(CommandHandler("gbanlist", gbanlist))
-    app.add_handler(CommandHandler("chats", chats_cmd))
-    app.add_handler(MessageHandler(filters.ChatType.GROUPS, register_chat), group=-1)
-    app.add_handler(ChatMemberHandler(track_chats, ChatMemberHandler.MY_CHAT_MEMBER))
-    app.add_handler(MessageHandler(filters.ChatType.GROUPS & ~filters.COMMAND, enforce), group=1)
-
-    log.info("Bot running...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
-
+@app.on_message(filters.command("start") & filters.private)
+async def start_handler(client: Client, message: Message):
+    await message.reply_text(
+        "👋 **Multi-Control Bot Online!**\n\n"
+        "• **Global Ban Sync:** Managed via private chat by the owner.\n"
+        "• **Voice Chat Control:** Use `/vcon` and `/vcoff` in groups.\n"
+        "• **VC Member Management:** Use `/vcmute` and `/vcunmute` by replying to users."
+    )
 
 if __name__ == "__main__":
-    main()
+    print("🤖 Starting Bot...")
+    app.run()
